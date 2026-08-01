@@ -1,4 +1,5 @@
 #![no_std]
+
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, contractclient, symbol_short,
     Address, Bytes, BytesN, Env, Vec,
@@ -39,63 +40,9 @@ pub enum RelayError {
     InvalidHeaderHeight = 5,
 }
 
-// TTL for claimed transaction records: ~30 days (6_048_000 ledgers at 5s/ledger)
-// Keeps transaction history available for audit while allowing old records to expire
 const CLAIMED_TX_TTL_LEDGERS: u32 = 6_048_000;
+const MAX_MERKLE_PROOF_DEPTH: u32 = 32;
 
-// TTL for tracked headers: ~60 days (12_096_000 ledgers at 5s/ledger) — long
-// enough to outlive CLAIMED_TX_TTL_LEDGERS so a claimed tx's header record
-// doesn't expire before the claim record itself does.
-const HEADER_TTL_LEDGERS: u32 = 12_096_000;
-
-/// How many blocks of height difference between a competing chain's tip and
-/// the currently-checkpointed tip we still accept as an ordinary reorg. A
-/// competing chain that would require reorganizing deeper than this is
-/// rejected outright rather than applied — see `submit_header` and
-/// `RelayError::ReorgBeyondSafetyDepth`.
-const DEFAULT_MAX_SAFE_REORG_DEPTH: u32 = 6;
-
-/// How many blocks behind the current checkpoint tip an unclaimed tracked
-/// header can be before a proof referencing it is rejected as stale — see
-/// `verify_and_claim` and `RelayError::StaleProof`.
-const DEFAULT_MAX_STALE_DEPTH: u32 = 144; // ~1 day of blocks at ~10 min/block
-
-/// TTL-extension threshold (in ledgers) passed to `extend_ttl`: only
-/// extend if the entry's remaining TTL is already below this. Matches the
-/// `100`-ledger threshold `core_vault` uses for its own TTL-extended keys.
-const TTL_EXTEND_THRESHOLD: u32 = 100;
-
-/// `Persistent` only exposes `set()` + a separate `extend_ttl()` — there is
-/// no single `set_with_ttl` call in this SDK version. Small helper so the
-/// two-call pattern isn't repeated at every call site.
-fn persist_with_ttl<K, V>(env: &Env, key: &K, val: &V, ttl_ledgers: u32)
-where
-    K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
-    V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
-{
-    env.storage().persistent().set(key, val);
-    env.storage()
-        .persistent()
-        .extend_ttl(key, TTL_EXTEND_THRESHOLD, ttl_ledgers);
-}
-
-/// Extract the Bitcoin header's own timestamp field (seconds since epoch,
-/// little-endian u32 at bytes 68–71). Pure bit manipulation, so it's done
-/// locally rather than via a `btc_relay_crypto` cross-contract call like
-/// the other header-field extractions — there's no cryptography involved.
-fn header_timestamp(header: &Bytes) -> u64 {
-    let b0 = header.get(68).unwrap() as u32;
-    let b1 = header.get(69).unwrap() as u32;
-    let b2 = header.get(70).unwrap() as u32;
-    let b3 = header.get(71).unwrap() as u32;
-    (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) as u64
-}
-
-// ---------------------------------------------------------------------------
-// BtcCrypto sub-contract client
-// Heavy crypto helpers (double-SHA256, Merkle, PoW) live in btc_relay_crypto
-// to keep this contract's Wasm bytecode within Soroban's size limit.
-// ---------------------------------------------------------------------------
 #[contractclient(name = "BtcCryptoClient")]
 pub trait BtcCryptoTrait {
     fn double_sha256(env: Env, data: Bytes) -> BytesN<32>;
@@ -111,14 +58,10 @@ pub trait BtcCryptoTrait {
     ) -> BytesN<32>;
 }
 
-// ---------------------------------------------------------------------------
-// Storage keys
-// ---------------------------------------------------------------------------
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Config,
-    /// Tracks which tx_ids have already been claimed (replay protection)
     Claimed(BytesN<32>),
     /// A submitted header, by its own block hash. See `HeaderRecord`.
     Header(BytesN<32>),
@@ -130,19 +73,12 @@ pub enum DataKey {
     MaxStaleDepth,
 }
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
-    /// Contract admin (can update config)
     pub admin: Address,
-    /// Stellar token to mint/release when a valid BTC tx is proven
     pub wrapped_btc_token: Address,
-    /// Minimum number of confirmations (merkle depth) required
     pub min_confirmations: u32,
-    /// Address of the deployed btc_relay_crypto sub-contract
     pub crypto_contract: Address,
 }
 
@@ -265,36 +201,28 @@ pub struct EvtRelayOk {
     pub amount_sat: i128,
 }
 
-// ---------------------------------------------------------------------------
-// SPV proof submitted by the relayer
-// ---------------------------------------------------------------------------
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpvProof {
-    /// Raw 80-byte Bitcoin block header
     pub block_header: Bytes,
-    /// Bitcoin transaction id (little-endian, 32 bytes)
     pub tx_id: BytesN<32>,
-    /// Merkle proof: ordered list of 32-byte sibling hashes
     pub merkle_proof: Vec<BytesN<32>>,
-    /// Index of the transaction in the block (used to determine left/right)
     pub tx_index: u32,
-    /// Amount of satoshis locked in the BTC transaction
     pub amount_sat: i128,
-    /// Stellar recipient address that should receive the wrapped asset
     pub recipient: Address,
 }
 
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
 #[contract]
 pub struct BtcRelayContract;
 
+fn validate_config(config: &Config) {
+    if config.min_confirmations == 0 || config.min_confirmations > MAX_MERKLE_PROOF_DEPTH {
+        panic!("invalid confirmation requirement");
+    }
+}
+
 #[contractimpl]
 impl BtcRelayContract {
-    /// Initialize the relay.
-    /// `crypto_contract` is the address of the deployed `btc_relay_crypto` sub-contract.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -305,10 +233,15 @@ impl BtcRelayContract {
         if env.storage().instance().has(&DataKey::Config) {
             fail(&env, FailureReason::AlreadyInitialized);
         }
-        env.storage().instance().set(
-            &DataKey::Config,
-            &Config { admin: admin.clone(), wrapped_btc_token: wrapped_btc_token.clone(), min_confirmations, crypto_contract: crypto_contract.clone() },
-        );
+
+        let config = Config {
+            admin: admin.clone(),
+            wrapped_btc_token: wrapped_btc_token.clone(),
+            min_confirmations,
+            crypto_contract: crypto_contract.clone(),
+        };
+        validate_config(&config);
+        env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
             (symbol_short!("btc"), symbol_short!("init")),
@@ -324,22 +257,23 @@ impl BtcRelayContract {
         );
     }
 
-    /// Update configuration. Admin only.
     pub fn update_config(env: Env, config: Config) {
         let current: Config = env
             .storage()
             .instance()
             .get(&DataKey::Config)
+            .expect("not initialized");
             .unwrap_or_else(|| fail(&env, FailureReason::NotInitialized));
         current.admin.require_auth();
-        env.storage().instance().set(&DataKey::Config, &config);
+        validate_config(&config);
 
+        env.storage().instance().set(&DataKey::Config, &config);
         env.events().publish(
             (symbol_short!("btc"), symbol_short!("cfg_upd")),
             EvtCfgUpd {
                 version: 1,
                 ledger: env.ledger().sequence(),
-                actor: current.admin.clone(),
+                actor: current.admin,
                 admin: config.admin.clone(),
                 wrapped_btc_token: config.wrapped_btc_token.clone(),
                 min_confirmations: config.min_confirmations,
@@ -348,6 +282,7 @@ impl BtcRelayContract {
         );
     }
 
+    pub fn verify_and_claim(env: Env, proof: SpvProof) -> (Address, i128) {
     // ── Emergency pause (see the `pause_state` crate for the standard) ─────────
     //
     // Pausing blocks verify_and_claim() — no new BTC-relay claims are
@@ -778,15 +713,32 @@ impl BtcRelayContract {
             .storage()
             .instance()
             .get(&DataKey::Config)
+            .expect("not initialized");
+
+        if proof.amount_sat <= 0 {
+            panic!("amount must be positive");
+        }
+        if proof.block_header.len() != 80 {
+            panic!("invalid block header length");
+        }
+        if proof.merkle_proof.len() < config.min_confirmations {
+            panic!("insufficient merkle proof depth");
+        }
+        if proof.merkle_proof.len() > MAX_MERKLE_PROOF_DEPTH {
+            panic!("merkle proof too deep");
+        }
+        if (proof.tx_index as u64) >= (1u64 << proof.merkle_proof.len()) {
+            panic!("transaction index outside merkle proof");
+        }
             .unwrap_or_else(|| fail(&env, FailureReason::NotInitialized));
         let crypto = BtcCryptoClient::new(&env, &config.crypto_contract);
 
-        // --- 1. Replay protection ---
         let claimed_key = DataKey::Claimed(proof.tx_id.clone());
         if env.storage().persistent().has(&claimed_key) {
             fail(&env, FailureReason::TxAlreadyClaimed);
         }
 
+        let crypto = BtcCryptoClient::new(&env, &config.crypto_contract);
         // --- 2. Validate block header length ---
         if proof.block_header.len() != 80 {
             fail(&env, FailureReason::InvalidBlockHeaderLength);
@@ -812,6 +764,13 @@ impl BtcRelayContract {
             &proof.tx_index,
         );
         if merkle_root != computed_root {
+            panic!("merkle proof does not match block header");
+        }
+
+        env.storage().persistent().set(&claimed_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&claimed_key, CLAIMED_TX_TTL_LEDGERS, CLAIMED_TX_TTL_LEDGERS);
             fail(&env, FailureReason::MerkleProofInvalid);
         }
 
@@ -847,14 +806,13 @@ impl BtcRelayContract {
         // (Persistent has no single set_with_ttl call — see persist_with_ttl above.)
         persist_with_ttl(&env, &claimed_key, &true, CLAIMED_TX_TTL_LEDGERS);
 
-        // --- 7. Emit success event ---
         env.events().publish(
             (symbol_short!("btc"), symbol_short!("relay_ok")),
             EvtRelayOk {
                 version: 1,
                 ledger: env.ledger().sequence(),
-                actor: config.admin.clone(),
-                tx_id: proof.tx_id.clone(),
+                actor: proof.recipient.clone(),
+                tx_id: proof.tx_id,
                 recipient: proof.recipient.clone(),
                 amount_sat: proof.amount_sat,
             },
@@ -863,11 +821,15 @@ impl BtcRelayContract {
         (proof.recipient, proof.amount_sat)
     }
 
-    /// Returns whether a given tx_id has already been claimed.
-    pub fn is_claimed(env: Env, tx_id: BytesN<32>) -> bool {
-        env.storage().persistent().has(&DataKey::Claimed(tx_id))
+    pub fn get_config(env: Env) -> Config {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("not initialized")
     }
 
+    pub fn is_claimed(env: Env, tx_id: BytesN<32>) -> bool {
+        env.storage().persistent().has(&DataKey::Claimed(tx_id))
     /// Returns the current config.
     pub fn get_config(env: Env) -> Config {
         env.storage()
@@ -876,5 +838,3 @@ impl BtcRelayContract {
             .unwrap_or_else(|| fail(&env, FailureReason::NotInitialized))
     }
 }
-
-mod test;

@@ -1,4 +1,5 @@
 #![no_std]
+
 use soroban_sdk::{contract, contractimpl, Bytes, BytesN, Env, Vec};
 
 /// Sub-contract: Bitcoin cryptographic helpers extracted from btc_relay to
@@ -20,6 +21,10 @@ impl BtcCryptoContract {
     /// Extract the 32-byte Merkle root from a Bitcoin block header.
     /// Bytes 36–67 (0-indexed) of the 80-byte header.
     pub fn extract_merkle_root(env: Env, header: Bytes) -> BytesN<32> {
+        if header.len() != 80 {
+            panic!("invalid block header length");
+        }
+
         let mut arr = [0u8; 32];
         for i in 0..32usize {
             arr[i] = header.get(36 + i as u32).unwrap();
@@ -44,25 +49,52 @@ impl BtcCryptoContract {
     }
 
     /// Decode the compact-format target (nBits) from the block header.
-    /// nBits field is at bytes 72–75 (little-endian u32).
+    /// nBits is at bytes 72–75 (little-endian).
     /// Returns a 32-byte big-endian target value.
     pub fn extract_target(env: Env, header: Bytes) -> BytesN<32> {
+        if header.len() != 80 {
+            panic!("invalid block header length");
+        }
+
         let b0 = header.get(72).unwrap() as u32;
         let b1 = header.get(73).unwrap() as u32;
         let b2 = header.get(74).unwrap() as u32;
         let b3 = header.get(75).unwrap() as u32;
-        let nbits: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        let nbits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
 
         let exponent = (nbits >> 24) as usize;
         let mantissa = nbits & 0x007f_ffff;
 
-        let mut target = [0u8; 32];
-        if exponent >= 1 && exponent <= 32 {
-            let base = 32usize.saturating_sub(exponent);
-            if base < 32     { target[base]     = ((mantissa >> 16) & 0xff) as u8; }
-            if base + 1 < 32 { target[base + 1] = ((mantissa >> 8)  & 0xff) as u8; }
-            if base + 2 < 32 { target[base + 2] = (mantissa         & 0xff) as u8; }
+        // The sign bit is not part of a valid proof-of-work target. Rejecting
+        // it is important because the previous implementation silently
+        // discarded it and accepted a different target than the header encoded.
+        if (nbits & 0x0080_0000) != 0 {
+            panic!("negative proof-of-work target");
         }
+        if mantissa == 0 {
+            panic!("zero proof-of-work target");
+        }
+        if exponent == 0 || exponent > 32 {
+            panic!("proof-of-work target overflow");
+        }
+
+        let mut target = [0u8; 32];
+        if exponent <= 3 {
+            let shifted = mantissa >> (8 * (3 - exponent));
+            target[31] = (shifted & 0xff) as u8;
+            if exponent >= 2 {
+                target[30] = ((shifted >> 8) & 0xff) as u8;
+            }
+            if exponent >= 3 {
+                target[29] = ((shifted >> 16) & 0xff) as u8;
+            }
+        } else {
+            let base = 32 - exponent;
+            target[base] = ((mantissa >> 16) & 0xff) as u8;
+            target[base + 1] = ((mantissa >> 8) & 0xff) as u8;
+            target[base + 2] = (mantissa & 0xff) as u8;
+        }
+
         BytesN::from_array(&env, &target)
     }
 
@@ -71,8 +103,12 @@ impl BtcCryptoContract {
         let h = hash.to_array();
         let t = target.to_array();
         for i in 0..32 {
-            if h[i] < t[i] { return true; }
-            if h[i] > t[i] { return false; }
+            if h[i] < t[i] {
+                return true;
+            }
+            if h[i] > t[i] {
+                return false;
+            }
         }
         true
     }
@@ -85,6 +121,17 @@ impl BtcCryptoContract {
         proof: Vec<BytesN<32>>,
         tx_index: u32,
     ) -> BytesN<32> {
+        // A Bitcoin Merkle path cannot contain more than 32 levels for a
+        // u32 transaction index. This also bounds attacker-controlled work.
+        if proof.len() > 32 {
+            panic!("merkle proof too deep");
+        }
+
+        let path_width = 1u64 << proof.len();
+        if (tx_index as u64) >= path_width {
+            panic!("transaction index outside merkle proof");
+        }
+
         let mut current = tx_id;
         let mut index = tx_index;
 
