@@ -1,23 +1,45 @@
 import { ValidationError } from './errors';
+import { parseScaled } from './fixedPoint';
+
+const DECIMAL_STRING_REGEX = /^-?\d+(?:\.\d+)?$/;
+
+/** Validate that `value` is a syntactically valid fixed-precision decimal. */
+const assertDecimalString = (value: string, fieldName: string): void => {
+  if (!DECIMAL_STRING_REGEX.test(value)) {
+    throw new ValidationError(`${fieldName} must be a valid decimal string, got ${value}`);
+  }
+};
+
+/** True when a decimal string is negative (sign-aware, no float coercion). */
+const isNegativeDecimal = (value: string): boolean => value.startsWith('-');
 
 export const validateNonNegative = (value: string, fieldName: string): void => {
-  const num = parseFloat(value);
-  if (isNaN(num)) {
-    throw new ValidationError(`${fieldName} must be a valid number, got ${value}`);
-  }
-  if (num < 0) {
+  assertDecimalString(value, fieldName);
+  if (isNegativeDecimal(value)) {
     throw new ValidationError(`${fieldName} cannot be negative, got ${value}`);
   }
 };
 
 export const validatePositive = (value: string, fieldName: string): void => {
-  const num = parseFloat(value);
-  if (isNaN(num)) {
-    throw new ValidationError(`${fieldName} must be a valid number, got ${value}`);
-  }
-  if (num <= 0) {
+  assertDecimalString(value, fieldName);
+  if (isNegativeDecimal(value)) {
     throw new ValidationError(`${fieldName} must be positive, got ${value}`);
   }
+  // Zero check without floating point: every digit is '0'.
+  const isZero =
+    value.replace('.', '').split('').every((ch) => ch === '0');
+  if (isZero) {
+    throw new ValidationError(`${fieldName} must be positive, got ${value}`);
+  }
+};
+
+/**
+ * Validate that a decimal string is non-negative AND fits the asset's
+ * precision (i.e. has no more than `decimals` fractional digits).
+ */
+export const validateNonNegativeAmount = (value: string, decimals: number): void => {
+  validateNonNegative(value, 'amount');
+  parseScaled(value, decimals); // throws on excess precision
 };
 
 export const validateAddress = (address: string): void => {

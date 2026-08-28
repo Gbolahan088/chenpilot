@@ -1,3 +1,8 @@
+import {
+  parseScaledAmount,
+  serializeScaledAmount,
+} from "./fixedAmount";
+
 /**
  * Stellar Claimable Balance Utilities
  *
@@ -213,17 +218,18 @@ export async function getTotalClaimableAmount(
 ): Promise<Record<string, string>> {
   const balances = await searchClaimableBalances(options);
 
-  const totals: Record<string, number> = {};
+  // #622: aggregate with fixed-precision (BigInt) arithmetic at Stellar's
+  // default 7 decimals — never float `number`.
+  const totals: Record<string, bigint> = {};
 
   for (const balance of balances) {
-    const amount = parseFloat(balance.amount);
-    totals[balance.asset] = (totals[balance.asset] || 0) + amount;
+    totals[balance.asset] =
+      (totals[balance.asset] ?? 0n) + parseScaledAmount(balance.amount, 7);
   }
 
-  // Convert back to strings with proper precision
   const result: Record<string, string> = {};
-  for (const [asset, amount] of Object.entries(totals)) {
-    result[asset] = amount.toFixed(7);
+  for (const [asset, units] of Object.entries(totals)) {
+    result[asset] = serializeScaledAmount(units, 7);
   }
 
   return result;

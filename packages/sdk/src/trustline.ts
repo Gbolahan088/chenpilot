@@ -1,6 +1,7 @@
 /// @ts-ignore: dependency is provided at the workspace root
 import { Server, Asset, Operation } from "stellar-sdk";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { parseScaledAmount } from "./fixedAmount";
 
 export interface TrustlineCheckResult {
   exists: boolean;
@@ -176,7 +177,7 @@ export async function findZeroBalanceTrustlines(
   const balances: Record<string, unknown>[] = (account.balances as Record<string, unknown>[]) || [];
 
   return balances
-    .filter((b) => b['asset_type'] !== "native" && parseFloat(b['balance'] as string) === 0)
+    .filter((b) => b['asset_type'] !== "native" && parseScaledAmount(b['balance'] as string, 7) === 0n)
     .map((b) => ({
       assetCode: b['asset_code'] as string,
       assetIssuer: b['asset_issuer'] as string,

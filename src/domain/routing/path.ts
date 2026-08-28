@@ -1,6 +1,18 @@
 import { Asset, AssetAmount } from '../assets';
 import { BaseEntity, UUID } from '../common';
+import {
+  divideDecimals,
+  multiplyDecimals,
+  parseScaled,
+  RoundingMode,
+  serializeScaled,
+} from '../common/fixedPoint';
 import * as StellarSdk from '@stellar/stellar-sdk';
+
+/** Parse a node price (a plain ratio, decimals=0 by default) as scaled units. */
+function parseFixedRatio(value: string): bigint {
+  return parseScaled(value, 0);
+}
 
 export interface PathNode {
   asset: Asset;
@@ -46,9 +58,15 @@ export class Path implements BaseEntity {
 
   getPriceImpact(): string {
     if (this.nodes.length === 0) return '0';
-    const firstPrice = parseFloat(this.nodes[0].price);
-    const lastPrice = parseFloat(this.nodes[this.nodes.length - 1].price);
-    return ((lastPrice - firstPrice) / firstPrice * 100).toString();
+    const firstPrice = parseFixedRatio(this.nodes[0].price);
+    const lastPrice = parseFixedRatio(this.nodes[this.nodes.length - 1].price);
+    if (firstPrice === 0n) return '0';
+    // priceImpact % = (last - first) / first * 100, at 2 decimal places.
+    const PERCENT_DECIMALS = 2;
+    const diff = lastPrice - firstPrice;
+    const impact = divideDecimals(diff, 0, firstPrice, 0, PERCENT_DECIMALS, RoundingMode.HALF_UP);
+    const pct = multiplyDecimals(impact, PERCENT_DECIMALS, 100n, 0, PERCENT_DECIMALS, RoundingMode.HALF_UP);
+    return serializeScaled(pct, PERCENT_DECIMALS);
   }
 
   toString(): string {
